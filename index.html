@@ -3,40 +3,33 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeoTagger Auto Sender + OCR</title>
+    <title>GeoSender High Precision</title>
     
-    <!-- React & ReactDOM -->
+    <!-- React & Libs -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    
-    <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    
-    <!-- ExifReader Library (Metadata) -->
     <script src="https://cdn.jsdelivr.net/npm/exifreader@4.20.0/dist/exif-reader.min.js"></script>
-
-    <!-- Tesseract.js (OCR / Text Recognition) -->
+    
+    <!-- Tesseract v5 -->
     <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
-
-    <!-- Font & Icons -->
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
 
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
-        .loader {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #3b82f6;
-            border-radius: 50%;
-            width: 30px;
-            height: 30px;
-            animation: spin 1s linear infinite;
+        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: white; }
+        .scan-line {
+            position: absolute;
+            width: 100%;
+            height: 4px;
+            background: #3b82f6;
+            box-shadow: 0 0 10px #3b82f6;
+            animation: scanning 2s linear infinite;
         }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .progress-bar { transition: width 0.3s ease; }
+        @keyframes scanning { 0% { top: 0; } 100% { top: 100%; } }
+        /* Hide scrollbar for logs */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     </style>
 </head>
 <body>
@@ -44,51 +37,98 @@
 
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
-
         const TARGET_PHONE = "6287745756269";
 
+        // --- IMAGE PROCESSING ENGINE ---
+        // Fungsi ini mengubah foto jadi Hitam Putih (Binarization) agar teks jelas terbaca
+        const preprocessImage = (imageFile) => {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    
+                    // Resize jika terlalu besar (max width 1024px) untuk performa
+                    const maxWidth = 1500;
+                    const scale = maxWidth / img.width;
+                    canvas.width = img.width > maxWidth ? maxWidth : img.width;
+                    canvas.height = img.width > maxWidth ? img.height * scale : img.height;
+                    
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    
+                    // Ambil data piksel
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    const data = imageData.data;
+                    
+                    // Loop piksel: Ubah ke Grayscale & Tingkatkan Kontras
+                    for (let i = 0; i < data.length; i += 4) {
+                        const r = data[i];
+                        const g = data[i + 1];
+                        const b = data[i + 2];
+                        
+                        // Rumus luminance (kecerahan)
+                        let gray = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        
+                        // Thresholding (Binarization): Jika terang jadi putih mutlak, gelap jadi hitam mutlak
+                        // Angka 100 bisa diatur (0-255). 120 biasanya pas untuk teks putih di latar gelap.
+                        const val = gray > 130 ? 255 : 0; 
+
+                        data[i] = val;     // R
+                        data[i + 1] = val; // G
+                        data[i + 2] = val; // B
+                    }
+                    
+                    ctx.putImageData(imageData, 0, 0);
+                    
+                    // Kembalikan sebagai Data URL (gambar baru)
+                    resolve(canvas.toDataURL('image/jpeg'));
+                };
+                img.onerror = reject;
+                img.src = URL.createObjectURL(imageFile);
+            });
+        };
+
         const App = () => {
-            const [status, setStatus] = useState("IDLE"); // IDLE, PROCESSING, OCR_SCANNING, SUCCESS, ERROR
+            const [status, setStatus] = useState("IDLE"); // IDLE, PROCESSING, OCR, MANUAL, SUCCESS
             const [logs, setLogs] = useState([]);
-            const [gpsData, setGpsData] = useState(null);
-            const [errorMessage, setErrorMessage] = useState("");
-            const [ocrProgress, setOcrProgress] = useState(0);
+            const [gpsData, setGpsData] = useState({ lat: '', long: '' });
+            const [previewUrl, setPreviewUrl] = useState(null);
+            const [processedPreview, setProcessedPreview] = useState(null);
+            const [progress, setProgress] = useState(0);
+            
             const fileInputRef = useRef(null);
+            const addLog = (msg) => setLogs(p => [`> ${msg}`, ...p]);
 
-            const addLog = (msg) => {
-                setLogs(prev => [...prev, msg]);
-            };
-
-            const resetApp = () => {
+            const reset = () => {
                 setStatus("IDLE");
                 setLogs([]);
-                setGpsData(null);
-                setErrorMessage("");
-                setOcrProgress(0);
+                setGpsData({ lat: '', long: '' });
+                setPreviewUrl(null);
+                setProcessedPreview(null);
+                setProgress(0);
                 if(fileInputRef.current) fileInputRef.current.value = "";
             };
 
-            // --- HELPER: Parse Koordinat dari Teks OCR ---
-            const findCoordinatesInText = (text) => {
-                // Pola Regex untuk menangkap format umum: -7.12345, 110.12345 (Desimal)
-                // Menangani variasi spasi, koma, atau baris baru
-                // Grup 1: Latitude, Grup 2: Longitude
-                const decimalPattern = /(-?\d{1,2}[.,]\d{4,})[\s,]+(-?\d{1,3}[.,]\d{4,})/;
-                
-                // Pola untuk format Lat: -7.123 Long: 110.123
-                const labeledPattern = /(?:Lat|Latitude)[\s:]*(-?\d{1,2}[.,]\d{3,}).*(?:Long|Lon|Longitude)[\s:]*(-?\d{1,3}[.,]\d{3,})/i;
+            const parseText = (text) => {
+                // Regex agresif mencari pola angka desimal
+                // Mencari angka seperti: -7.1234 atau 110.1234
+                // Menangani spasi aneh hasil OCR: - 7 . 1234
+                const cleanText = text.replace(/[^0-9.,\-\n]/g, ' '); // Hapus huruf, sisakan angka & simbol
+                const numbers = cleanText.match(/-?\d{1,3}[.,]\d{4,}/g);
 
-                let match = text.match(decimalPattern);
-                if (!match) {
-                    match = text.match(labeledPattern);
-                }
+                if (numbers && numbers.length >= 2) {
+                    // Asumsi: Angka pertama Lat, kedua Long (atau sebaliknya tergantung besaran)
+                    // Biasanya Lat Indonesia -10 s/d 6, Long 95 s/d 141
+                    let v1 = parseFloat(numbers[0].replace(',', '.'));
+                    let v2 = parseFloat(numbers[1].replace(',', '.'));
+                    
+                    let lat = v1;
+                    let long = v2;
 
-                if (match) {
-                    // Ganti koma dengan titik jika formatnya Indonesia (misal -7,123)
-                    let lat = parseFloat(match[1].replace(',', '.'));
-                    let long = parseFloat(match[2].replace(',', '.'));
+                    // Swap logic pintar untuk Indonesia
+                    // Jika v1 > 90, itu pasti Longitude
+                    if (Math.abs(v1) > 90) { lat = v2; long = v1; }
 
-                    // Validasi range latitude longitude
                     if (lat >= -90 && lat <= 90 && long >= -180 && long <= 180) {
                         return { lat, long };
                     }
@@ -97,231 +137,171 @@
             };
 
             const runOCR = async (file) => {
-                setStatus("OCR_SCANNING");
-                addLog("👁️ Mencoba scan tulisan di foto (OCR)...");
-                addLog("⏳ Mohon tunggu, proses AI sedang berjalan...");
-
+                setStatus("OCR");
+                addLog("⚙️ Pre-processing: Mempertajam kontras...");
+                
                 try {
-                    const result = await Tesseract.recognize(
-                        file,
-                        'eng',
-                        {
-                            logger: m => {
-                                if (m.status === 'recognizing text') {
-                                    setOcrProgress(Math.round(m.progress * 100));
-                                }
-                            }
-                        }
-                    );
+                    // 1. Proses Gambar (Jadi Hitam Putih)
+                    const highContrastImage = await preprocessImage(file);
+                    setProcessedPreview(highContrastImage); // Tampilkan apa yang dilihat AI
+                    
+                    addLog("🧠 AI Membaca teks...");
+                    
+                    // 2. Jalankan Tesseract pada gambar hasil proses
+                    const worker = await Tesseract.createWorker('eng');
+                    // Whitelist: Paksa hanya baca angka dan simbol relevan
+                    await worker.setParameters({
+                        tessedit_char_whitelist: '0123456789.-,LatLong: ',
+                    });
 
-                    const extractedText = result.data.text;
-                    addLog("✅ Teks terbaca. Menganalisis pola koordinat...");
-                    console.log("OCR Text:", extractedText); // Debugging
-
-                    const coords = findCoordinatesInText(extractedText);
+                    const ret = await worker.recognize(highContrastImage);
+                    addLog("✅ Scan selesai. Menganalisis hasil...");
+                    
+                    const coords = parseText(ret.data.text);
+                    await worker.terminate();
 
                     if (coords) {
-                        const latFixed = coords.lat.toFixed(6);
-                        const longFixed = coords.long.toFixed(6);
-                        
-                        finishSuccess(latFixed, longFixed, "OCR (Scan Teks)");
+                        finish(coords.lat, coords.long, "AI Scan");
                     } else {
-                        // Coba bersihkan teks dan cari lagi (kadang OCR baca 'S' sebagai '5' atau spasi aneh)
-                        // Untuk versi simpel, kita throw error dulu
-                        throw new Error("Teks terbaca tapi TIDAK ditemukan koordinat yang valid. Pastikan watermark Lat/Long terlihat jelas.");
+                        addLog("⚠️ Angka tidak ditemukan di hasil scan.");
+                        setStatus("MANUAL");
                     }
 
-                } catch (err) {
-                    console.error(err);
-                    setStatus("ERROR");
-                    setErrorMessage("Gagal Scan OCR: " + err.message);
-                    addLog(`❌ OCR Error: ${err.message}`);
+                } catch (e) {
+                    console.error(e);
+                    addLog("❌ OCR Error: " + e.message);
+                    setStatus("MANUAL");
                 }
             };
 
-            const finishSuccess = (lat, long, source) => {
-                const resultData = {
-                    lat: lat,
-                    long: long,
-                    mapsLink: `https://www.google.com/maps?q=${lat},${long}`
-                };
-
-                setGpsData(resultData);
-                addLog(`📍 Lokasi Ditemukan (${source}): ${lat}, ${long}`);
+            const finish = (lat, long, method) => {
+                const latF = Number(lat).toFixed(6);
+                const longF = Number(long).toFixed(6);
+                setGpsData({ lat: latF, long: longF });
                 setStatus("SUCCESS");
-                generateAndSendWhatsApp(resultData);
-            }
-
-            const processFile = async (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-
-                resetApp();
-                setStatus("PROCESSING");
-                addLog(`📂 Menganalisis file: ${file.name}`);
-                
-                // STEP 1: Coba baca EXIF dulu (Siapa tau file asli)
-                try {
-                    addLog("🔍 Mencari metadata EXIF...");
-                    const tags = await ExifReader.load(file, { expanded: true });
-                    
-                    let lat = null;
-                    let long = null;
-
-                    // Logika pencarian EXIF standard
-                    if (tags.gps) {
-                        if (tags.gps.Latitude && tags.gps.Longitude) {
-                            lat = tags.gps.Latitude;
-                            long = tags.gps.Longitude;
-                        }
-                    } else if (tags.GPSLatitude && tags.GPSLongitude) {
-                        // Fallback simple tags
-                        // Note: ExifReader v4 expanded=false output format differs, handled in v2 code
-                        // Here assuming failures go to catch block or runOCR
-                    }
-
-                    if (lat && long) {
-                        // Jika EXIF ada, pakai EXIF (lebih akurat)
-                        finishSuccess(Number(lat).toFixed(6), Number(long).toFixed(6), "EXIF Metadata");
-                        return;
-                    } 
-                    
-                    // Jika tidak ada error tapi tidak ada GPS tags
-                    throw new Error("No GPS Tags");
-
-                } catch (err) {
-                    addLog("⚠️ EXIF tidak ditemukan (File dari WA?).");
-                    // STEP 2: Lanjut ke OCR
-                    await runOCR(file);
-                }
-            };
-
-            const generateAndSendWhatsApp = (data) => {
-                addLog("🚀 Mempersiapkan pesan WhatsApp...");
-                
-                const message = `📸 FOTO TERDETEKSI
-📍 Lokasi GPS:
-Latitude: ${data.lat}
-Longitude: ${data.long}
-
-🗺️ Google Maps:
-${data.mapsLink}`;
-
-                const encodedMessage = encodeURIComponent(message);
-                const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodedMessage}`;
-
-                addLog("📨 Mengalihkan ke WhatsApp...");
                 
                 setTimeout(() => {
-                    window.location.href = waUrl;
+                   sendWA(latF, longF);
                 }, 1500);
             };
 
+            const sendWA = (lat, long) => {
+                const link = `https://www.google.com/maps?q=${lat},${long}`;
+                const msg = `📸 FOTO TERDETEKSI\n📍 Lokasi GPS:\nLatitude: ${lat}\nLongitude: ${long}\n\n🗺️ Google Maps:\n${link}`;
+                window.location.href = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
+            };
+
+            const handleFile = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                reset();
+                setPreviewUrl(URL.createObjectURL(file));
+                addLog("📂 File dimuat. Cek EXIF...");
+
+                try {
+                    const tags = await ExifReader.load(file, { expanded: true });
+                    if (tags.gps?.Latitude && tags.gps?.Longitude) {
+                        finish(tags.gps.Latitude, tags.gps.Longitude, "EXIF");
+                    } else {
+                        throw new Error("No EXIF");
+                    }
+                } catch {
+                    addLog("⚠️ EXIF nihil. Menjalankan AI...");
+                    runOCR(file);
+                }
+            };
+
             return (
-                <div className="min-h-screen flex flex-col items-center justify-center p-4">
-                    <div className="w-full max-w-md bg-slate-800 rounded-2xl shadow-2xl overflow-hidden border border-slate-700">
+                <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-slate-900">
+                    <div className="w-full max-w-md bg-slate-800 rounded-2xl border border-slate-700 shadow-2xl overflow-hidden relative">
                         
                         {/* Header */}
-                        <div className="bg-indigo-600 p-6 text-center">
-                            <h1 className="text-xl font-bold text-white flex items-center justify-center gap-2">
-                                <i data-lucide="scan-line"></i> GeoScanner Pro
-                            </h1>
-                            <p className="text-indigo-100 text-xs mt-1">Support: EXIF Metadata & OCR Text Scan</p>
+                        <div className="bg-blue-600 p-4 flex justify-between items-center">
+                            <h1 className="font-bold text-white flex gap-2"><i data-lucide="scan-eye"></i> Precision Scanner</h1>
+                            <div className="text-xs bg-blue-500 px-2 py-1 rounded text-blue-100">v5.0</div>
                         </div>
 
-                        {/* Content */}
-                        <div className="p-6 space-y-6">
+                        {/* Main Stage */}
+                        <div className="p-4">
                             
-                            {/* Input Area */}
-                            {status === "IDLE" || status === "ERROR" || status === "SUCCESS" ? (
-                                <div className="relative group">
-                                    <label className="flex flex-col items-center justify-center w-full h-48 border-2 border-dashed border-slate-500 rounded-xl cursor-pointer bg-slate-700/50 hover:bg-slate-700 transition-all hover:border-indigo-400 group-hover:scale-[1.01]">
-                                        <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                                            <svg className="w-12 h-12 mb-4 text-slate-400 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                                            <p className="mb-2 text-sm text-slate-300 text-center px-4"><span className="font-semibold text-white">Upload Foto</span><br/>(EXIF atau Foto Ber-Watermark)</p>
+                            {/* Input Zone */}
+                            {(status === 'IDLE' || status === 'SUCCESS') && (
+                                <label className="block w-full h-40 border-2 border-dashed border-slate-600 rounded-xl bg-slate-700/50 hover:bg-slate-700 hover:border-blue-400 transition cursor-pointer flex flex-col items-center justify-center text-slate-400">
+                                    <i data-lucide="upload-cloud" className="w-10 h-10 mb-2"></i>
+                                    <span className="text-sm">Upload Foto (Watermark/EXIF)</span>
+                                    <input type="file" className="hidden" onChange={handleFile} accept="image/*"/>
+                                </label>
+                            )}
+
+                            {/* Visualization Zone (Apa yang dilihat AI) */}
+                            {status === 'OCR' && (
+                                <div className="space-y-2">
+                                    <p className="text-xs text-blue-300 text-center animate-pulse">Sedang memproses kontras gambar...</p>
+                                    <div className="flex gap-2 h-32">
+                                        {/* Original */}
+                                        <div className="flex-1 relative rounded overflow-hidden border border-slate-600">
+                                            <img src={previewUrl} className="w-full h-full object-cover opacity-50"/>
+                                            <div className="absolute inset-0 flex items-center justify-center text-xs font-bold text-white drop-shadow-md">ASLI</div>
                                         </div>
-                                        <input 
-                                            type="file" 
-                                            className="hidden" 
-                                            accept="image/*,.heic" 
-                                            onChange={processFile} 
-                                            ref={fileInputRef}
-                                        />
-                                    </label>
-                                </div>
-                            ) : null}
-
-                            {/* Processing Status */}
-                            {status === "PROCESSING" && (
-                                <div className="flex flex-col items-center py-8 text-center space-y-4">
-                                    <div className="loader"></div>
-                                    <p className="text-indigo-300 animate-pulse">Cek Metadata EXIF...</p>
+                                        {/* Processed */}
+                                        <div className="flex-1 relative rounded overflow-hidden border border-blue-500">
+                                            {processedPreview ? (
+                                                <img src={processedPreview} className="w-full h-full object-cover"/>
+                                            ) : (
+                                                <div className="w-full h-full bg-slate-900 flex items-center justify-center"><div className="w-4 h-4 bg-blue-500 animate-spin rounded-sm"></div></div>
+                                            )}
+                                            <div className="scan-line"></div>
+                                            <div className="absolute top-0 left-0 bg-blue-600 text-[10px] px-1 text-white">AI VISION</div>
+                                        </div>
+                                    </div>
                                 </div>
                             )}
 
-                            {/* OCR Scanning Status */}
-                            {status === "OCR_SCANNING" && (
-                                <div className="space-y-4">
-                                    <div className="flex flex-col items-center text-center">
-                                        <div className="loader border-t-purple-500"></div>
-                                        <p className="text-purple-300 mt-4 text-sm font-semibold">Memindai Teks (AI)...</p>
-                                        <p className="text-slate-400 text-xs">Mencari angka Latitude/Longitude pada gambar</p>
+                            {/* Manual Fallback Zone */}
+                            {status === 'MANUAL' && (
+                                <div className="bg-slate-700/50 p-4 rounded-xl border border-orange-500/30 animate-fade-in">
+                                    <div className="flex items-start gap-3 mb-4">
+                                        <img src={processedPreview || previewUrl} className="w-20 h-20 object-cover rounded border border-slate-500"/>
+                                        <div className="flex-1">
+                                            <h3 className="text-sm font-bold text-orange-400">Bantu konfirmasi</h3>
+                                            <p className="text-xs text-slate-300 mt-1">AI kesulitan membaca digit yang tepat. Ketik manual:</p>
+                                        </div>
                                     </div>
-                                    <div className="w-full bg-slate-700 rounded-full h-2.5">
-                                        <div className="bg-purple-500 h-2.5 rounded-full progress-bar" style={{width: `${ocrProgress}%`}}></div>
-                                    </div>
-                                    <p className="text-right text-xs text-slate-400">{ocrProgress}%</p>
-                                </div>
-                            )}
-
-                            {/* Success UI */}
-                            {status === "SUCCESS" && gpsData && (
-                                <div className="bg-green-500/20 border border-green-500/50 rounded-lg p-4 text-center space-y-3">
-                                    <div className="flex justify-center text-green-400">
-                                        <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                    </div>
-                                    <h3 className="text-lg font-bold text-white">Data Ditemukan!</h3>
-                                    <div className="text-xs bg-black/30 p-2 rounded text-left font-mono break-all">
-                                        <span className="text-gray-400">Lat:</span> {gpsData.lat}<br/>
-                                        <span className="text-gray-400">Long:</span> {gpsData.long}
-                                    </div>
-                                    <button 
-                                        onClick={() => generateAndSendWhatsApp(gpsData)}
-                                        className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded transition-colors text-sm flex items-center justify-center gap-2"
-                                    >
-                                        <i data-lucide="send"></i> Kirim WA Sekarang
-                                    </button>
-                                </div>
-                            )}
-
-                            {/* Error UI */}
-                            {status === "ERROR" && (
-                                <div className="bg-red-500/20 border border-red-500/50 rounded-lg p-4">
-                                    <div className="flex items-start gap-3">
-                                        <svg className="w-6 h-6 text-red-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                    <div className="grid grid-cols-2 gap-3 mb-3">
                                         <div>
-                                            <h3 className="font-bold text-red-400 text-sm">Gagal Deteksi</h3>
-                                            <p className="text-xs text-red-200 mt-1">{errorMessage}</p>
+                                            <label className="text-[10px] text-slate-400">Latitude</label>
+                                            <input type="text" placeholder="-7.xxxxx" className="w-full bg-slate-900 border border-slate-600 rounded p-2 text-sm focus:border-blue-500 outline-none text-white"
+                                                value={gpsData.lat} onChange={e => setGpsData({...gpsData, lat: e.target.value})} />
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] text-slate-400">Longitude</label>
+                                            <input type="text" placeholder="110.xxxxx" className="w-full bg-slate-900 border border-slate-600 rounded p-2 text-sm focus:border-blue-500 outline-none text-white"
+                                                value={gpsData.long} onChange={e => setGpsData({...gpsData, long: e.target.value})} />
                                         </div>
                                     </div>
-                                    <div className="mt-3 text-xs text-slate-400 bg-slate-800/50 p-2 rounded">
-                                        Tips: Pastikan teks koordinat pada foto terlihat jelas, tidak blur, dan kontras dengan background.
-                                    </div>
+                                    <button onClick={() => finish(gpsData.lat, gpsData.long, "MANUAL")} className="w-full bg-orange-600 hover:bg-orange-700 text-white py-2 rounded text-sm font-bold">Kirim Sekarang</button>
                                 </div>
                             )}
 
-                            {/* Console Logs Display */}
-                            <div className="bg-black/40 rounded p-3 h-32 overflow-y-auto text-xs font-mono text-slate-400 border border-slate-700">
-                                {logs.length === 0 ? <span className="opacity-50">Log sistem siap...</span> : logs.map((log, i) => (
-                                    <div key={i} className="mb-1 border-b border-white/5 pb-1 last:border-0">{log}</div>
-                                ))}
-                            </div>
+                            {/* Success Zone */}
+                            {status === 'SUCCESS' && (
+                                <div className="text-center py-4">
+                                    <div className="w-16 h-16 bg-green-500/20 text-green-400 rounded-full flex items-center justify-center mx-auto mb-3 border border-green-500/50">
+                                        <i data-lucide="check" className="w-8 h-8"></i>
+                                    </div>
+                                    <h2 className="text-xl font-bold text-white">Lokasi Terkunci</h2>
+                                    <p className="text-slate-400 text-sm mb-4">Membuka WhatsApp...</p>
+                                    <button onClick={() => sendWA(gpsData.lat, gpsData.long)} className="px-6 py-2 bg-green-600 rounded-full text-white text-sm font-bold shadow-lg shadow-green-900/20">Buka Manual</button>
+                                </div>
+                            )}
 
                         </div>
-                        
-                        <div className="bg-slate-900 p-3 text-center text-xs text-slate-500 flex justify-between px-6">
-                            <span>v3.0 Hybrid (EXIF + OCR)</span>
-                            <span className="text-slate-600">Secure Client-Side</span>
+
+                        {/* Logs Console */}
+                        <div className="bg-black/50 p-3 h-24 overflow-y-auto font-mono text-[10px] text-slate-500 border-t border-slate-700">
+                            {logs.map((l, i) => <div key={i}>{l}</div>)}
+                            {logs.length === 0 && <div>Menunggu file...</div>}
                         </div>
                     </div>
                 </div>
@@ -330,8 +310,6 @@ ${data.mapsLink}`;
 
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
-        
-        // Initialize Icons
         lucide.createIcons();
     </script>
 </body>
