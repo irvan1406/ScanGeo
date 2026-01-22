@@ -1,52 +1,61 @@
 <!DOCTYPE html>
-<html lang="id">
+<html lang="id" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeoSender Auto-Redirect</title>
+    <title>GeoSender Ultimate Pro v7</title>
     
-    <!-- React & Libs -->
+    <!-- React Core -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/exifreader@4.20.0/dist/exif-reader.min.js"></script>
     
-    <!-- Tesseract v5 -->
-    <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
+    <!-- Styling & Icons -->
+    <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { primary: '#10b981', secondary: '#3b82f6' } } }
+        }
+    </script>
+    
+    <!-- Logic Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/exifreader@4.20.0/dist/exif-reader.min.js"></script>
+    <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
 
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: white; }
-        .scan-line {
-            position: absolute;
-            width: 100%;
-            height: 4px;
-            background: #3b82f6;
-            box-shadow: 0 0 10px #3b82f6;
-            animation: scanning 2s linear infinite;
+        body { font-family: 'Inter', system-ui, sans-serif; transition: background 0.3s; }
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
-        @keyframes scanning { 0% { top: 0; } 100% { top: 100%; } }
-        /* Hide scrollbar for logs */
-        .no-scrollbar::-webkit-scrollbar { display: none; }
-        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .animate-slide-up { animation: slideUp 0.5s ease-out; }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        
+        /* Map Preview Helper */
+        .map-frame { filter: grayscale(20%) contrast(1.1); border-radius: 0.75rem; }
     </style>
 </head>
-<body>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
     <div id="root"></div>
 
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
-        const TARGET_PHONE = "6287745756269";
+        
+        // --- KONFIGURASI ---
+        const TARGET_PHONE = "6287745756269"; 
 
-        // --- IMAGE PROCESSING ENGINE ---
-        const preprocessImage = (imageFile) => {
+        // --- HELPER: Image Processing (Black & White for OCR) ---
+        const preprocessImage = (blobUrl) => {
             return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.onload = () => {
                     const canvas = document.createElement('canvas');
                     const ctx = canvas.getContext('2d');
-                    const maxWidth = 1500;
+                    // Resize optimization
+                    const maxWidth = 1200;
                     const scale = maxWidth / img.width;
                     canvas.width = img.width > maxWidth ? maxWidth : img.width;
                     canvas.height = img.width > maxWidth ? img.height * scale : img.height;
@@ -55,202 +64,342 @@
                     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                     const data = imageData.data;
                     
+                    // High Contrast Binarization
                     for (let i = 0; i < data.length; i += 4) {
-                        const r = data[i];
-                        const g = data[i + 1];
-                        const b = data[i + 2];
-                        let gray = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                        const val = gray > 130 ? 255 : 0; 
-                        data[i] = val; data[i + 1] = val; data[i + 2] = val;
+                        const gray = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+                        const val = gray > 140 ? 255 : 0; 
+                        data[i] = data[i+1] = data[i+2] = val;
                     }
                     ctx.putImageData(imageData, 0, 0);
                     resolve(canvas.toDataURL('image/jpeg'));
                 };
-                img.onerror = reject;
-                img.src = URL.createObjectURL(imageFile);
+                img.src = blobUrl;
             });
         };
 
+        // --- HELPER: Reverse Geocoding (Cari Alamat) ---
+        const getAddress = async (lat, long) => {
+            try {
+                // Menggunakan Nominatim OpenStreetMap (Gratis, No Key)
+                const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${long}&zoom=18&addressdetails=1`, {
+                    headers: { 'User-Agent': 'GeoSenderApp/7.0' }
+                });
+                const data = await res.json();
+                return data.display_name || "Alamat tidak ditemukan";
+            } catch (e) {
+                return "Gagal memuat alamat (Offline?)";
+            }
+        };
+
         const App = () => {
-            const [status, setStatus] = useState("IDLE"); // IDLE, PROCESSING, OCR, MANUAL, SUCCESS
+            // State Management
+            const [view, setView] = useState('HOME'); // HOME, HISTORY
+            const [status, setStatus] = useState('IDLE'); 
+            const [file, setFile] = useState(null);
+            const [preview, setPreview] = useState(null);
+            const [data, setData] = useState({ lat: '', long: '', address: 'Mengambil alamat...', mapsLink: '' });
             const [logs, setLogs] = useState([]);
-            const [gpsData, setGpsData] = useState({ lat: '', long: '' });
-            const [previewUrl, setPreviewUrl] = useState(null);
-            const [processedPreview, setProcessedPreview] = useState(null);
-            
+            const [history, setHistory] = useState(() => {
+                return JSON.parse(localStorage.getItem('geo_history') || '[]');
+            });
             const fileInputRef = useRef(null);
+
+            // Persist History
+            useEffect(() => {
+                localStorage.setItem('geo_history', JSON.stringify(history));
+            }, [history]);
+
             const addLog = (msg) => setLogs(p => [`> ${msg}`, ...p]);
 
-            const reset = () => {
-                setStatus("IDLE");
+            // --- CORE LOGIC ---
+            const handleFile = async (e) => {
+                const selectedFile = e.target.files[0];
+                if (!selectedFile) return;
+
+                setFile(selectedFile);
+                setPreview(URL.createObjectURL(selectedFile));
+                setStatus('PROCESSING');
                 setLogs([]);
-                setGpsData({ lat: '', long: '' });
-                setPreviewUrl(null);
-                setProcessedPreview(null);
-                if(fileInputRef.current) fileInputRef.current.value = "";
-            };
+                addLog("File diterima. Menganalisis...");
 
-            const parseText = (text) => {
-                const cleanText = text.replace(/[^0-9.,\-\n]/g, ' '); 
-                const numbers = cleanText.match(/-?\d{1,3}[.,]\d{4,}/g);
-
-                if (numbers && numbers.length >= 2) {
-                    let v1 = parseFloat(numbers[0].replace(',', '.'));
-                    let v2 = parseFloat(numbers[1].replace(',', '.'));
-                    let lat = v1; let long = v2;
-                    if (Math.abs(v1) > 90) { lat = v2; long = v1; } // Swap logic
-
-                    if (lat >= -90 && lat <= 90 && long >= -180 && long <= 180) {
-                        return { lat, long };
-                    }
-                }
-                return null;
-            };
-
-            const runOCR = async (file) => {
-                setStatus("OCR");
-                addLog("⚙️ Pre-processing: Mempertajam kontras...");
-                
                 try {
-                    const highContrastImage = await preprocessImage(file);
-                    setProcessedPreview(highContrastImage); 
+                    // 1. Cek EXIF
+                    addLog("Mencoba baca metadata EXIF...");
+                    const tags = await ExifReader.load(selectedFile, { expanded: true });
                     
-                    addLog("🧠 AI Membaca teks...");
-                    const worker = await Tesseract.createWorker('eng');
-                    await worker.setParameters({ tessedit_char_whitelist: '0123456789.-,LatLong: ', });
+                    if (tags.gps?.Latitude && tags.gps?.Longitude) {
+                        await finalizeLocation(tags.gps.Latitude, tags.gps.Longitude, "EXIF Metadata");
+                    } else {
+                        throw new Error("EXIF Missing");
+                    }
+                } catch (err) {
+                    // 2. Fallback ke OCR
+                    addLog("EXIF kosong. Beralih ke AI OCR...");
+                    await runOCR(selectedFile);
+                }
+            };
 
-                    const ret = await worker.recognize(highContrastImage);
-                    const coords = parseText(ret.data.text);
+            const runOCR = async (fileBlob) => {
+                setStatus('OCR_SCANNING');
+                try {
+                    const processedImg = await preprocessImage(URL.createObjectURL(fileBlob));
+                    const worker = await Tesseract.createWorker('eng');
+                    await worker.setParameters({ tessedit_char_whitelist: '0123456789.-,LatLong: ' });
+                    
+                    addLog("AI memindai teks pada foto...");
+                    const res = await worker.recognize(processedImg);
                     await worker.terminate();
 
-                    if (coords) {
-                        finish(coords.lat, coords.long, "AI Scan");
-                    } else {
-                        addLog("⚠️ Angka tidak ditemukan. Manual mode.");
-                        setStatus("MANUAL");
-                    }
+                    // Regex Parsing
+                    const txt = res.data.text.replace(/[^0-9.,\-\n]/g, ' ');
+                    const nums = txt.match(/-?\d{1,3}[.,]\d{4,}/g);
 
+                    if (nums && nums.length >= 2) {
+                        let v1 = parseFloat(nums[0].replace(',', '.'));
+                        let v2 = parseFloat(nums[1].replace(',', '.'));
+                        // Swap logic lat/long Indonesia
+                        let lat = Math.abs(v1) > 90 ? v2 : v1;
+                        let long = Math.abs(v1) > 90 ? v1 : v2;
+                        
+                        await finalizeLocation(lat, long, "AI Vision Scan");
+                    } else {
+                        setStatus('MANUAL_INPUT');
+                        addLog("Gagal baca otomatis. Silakan input manual.");
+                    }
                 } catch (e) {
-                    addLog("❌ OCR Error: " + e.message);
-                    setStatus("MANUAL");
+                    setStatus('MANUAL_INPUT');
+                    addLog("OCR Error: " + e.message);
                 }
             };
 
-            // --- FUNGSI UTAMA AUTO SEND ---
-            const finish = (lat, long, method) => {
+            const finalizeLocation = async (lat, long, method) => {
                 const latF = Number(lat).toFixed(6);
                 const longF = Number(long).toFixed(6);
-                setGpsData({ lat: latF, long: longF });
-                setStatus("SUCCESS");
                 
-                addLog(`✅ Lokasi OK (${method}). Membuka WA...`);
+                addLog(`Lokasi ditemukan (${method}). Mengambil alamat...`);
+                const addressStr = await getAddress(latF, longF);
+                
+                const newData = {
+                    lat: latF,
+                    long: longF,
+                    address: addressStr,
+                    mapsLink: `https://www.google.com/maps?q=${latF},${longF}`,
+                    timestamp: new Date().toLocaleString()
+                };
 
-                // AUTO REDIRECT TANPA KLIK
-                // Delay 800ms agar user sempat lihat centang hijau, lalu lgsg pindah
-                setTimeout(() => {
-                   sendWA(latF, longF);
-                }, 800);
+                setData(newData);
+                setStatus('SUCCESS');
+                
+                // Simpan ke history
+                setHistory(prev => [newData, ...prev].slice(0, 50));
             };
 
-            const sendWA = (lat, long) => {
-                const link = `https://www.google.com/maps?q=${lat},${long}`;
-                const msg = `📸 FOTO TERDETEKSI\n📍 Lokasi GPS:\nLatitude: ${lat}\nLongitude: ${long}\n\n🗺️ Google Maps:\n${link}`;
-                window.location.href = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
-            };
+            // --- SHARING ENGINE (NATIVE) ---
+            const shareViaNative = async () => {
+                const message = `🚨 *LAPORAN FOTO GEOTAG*\n\n📍 *Koordinat:* \n${data.lat}, ${data.long}\n\n🏠 *Alamat:*\n${data.address}\n\n🗺️ *Maps:* ${data.mapsLink}\n\n_Dikirim otomatis oleh GeoSender Pro_`;
 
-            const handleFile = async (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-                
-                reset();
-                setPreviewUrl(URL.createObjectURL(file));
-                addLog("📂 Cek Metadata EXIF...");
+                // Cek kapabilitas browser
+                if (navigator.share && navigator.canShare) {
+                    try {
+                        // Harus convert blob agar bisa dishare sebagai file
+                        const fileBlob = await fetch(preview).then(r => r.blob());
+                        const shareFile = new File([fileBlob], `Laporan_${Date.now()}.jpg`, { type: fileBlob.type });
 
-                try {
-                    const tags = await ExifReader.load(file, { expanded: true });
-                    if (tags.gps?.Latitude && tags.gps?.Longitude) {
-                        finish(tags.gps.Latitude, tags.gps.Longitude, "EXIF");
-                    } else {
-                        throw new Error("No EXIF");
+                        if (navigator.canShare({ files: [shareFile] })) {
+                            addLog("Membuka Share Sheet System...");
+                            await navigator.share({
+                                title: 'Laporan GeoTag',
+                                text: message,
+                                files: [shareFile]
+                            });
+                            addLog("Berhasil dibagikan!");
+                        } else {
+                            throw new Error("Browser tidak mendukung share file gambar.");
+                        }
+                    } catch (e) {
+                        addLog("Native share gagal/batal. Fallback ke WA Link.");
+                        fallbackWhatsApp(message);
                     }
-                } catch {
-                    addLog("⚠️ EXIF nihil. Menjalankan AI...");
-                    runOCR(file);
+                } else {
+                    addLog("Browser ini tidak mendukung Native Share (biasanya PC).");
+                    fallbackWhatsApp(message);
                 }
             };
 
+            const fallbackWhatsApp = (msg) => {
+                // Di PC atau browser lama, kita tidak bisa attach gambar otomatis ke WA
+                // Jadi kita kirim text link saja
+                window.open(`https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`, '_blank');
+            };
+
+            // --- UI COMPONENTS ---
             return (
-                <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-slate-900">
-                    <div className="w-full max-w-md bg-slate-800 rounded-2xl border border-slate-700 shadow-2xl overflow-hidden relative">
+                <div className="max-w-md mx-auto min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 shadow-2xl overflow-hidden relative font-sans">
+                    
+                    {/* Top Bar */}
+                    <div className="p-4 flex justify-between items-center bg-slate-900/50 backdrop-blur border-b border-slate-700 sticky top-0 z-10">
+                        <div className="flex items-center gap-2">
+                            <div className="bg-primary p-1.5 rounded-lg shadow-[0_0_15px_rgba(16,185,129,0.4)]">
+                                <i data-lucide="satellite" className="text-slate-900 w-5 h-5"></i>
+                            </div>
+                            <h1 className="font-bold text-lg tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">GeoSender <span className="text-primary text-xs align-top">PRO</span></h1>
+                        </div>
+                        <button onClick={() => setView(view === 'HOME' ? 'HISTORY' : 'HOME')} className="p-2 hover:bg-slate-700 rounded-full transition">
+                            <i data-lucide={view === 'HOME' ? 'history' : 'x'} className="text-slate-300 w-5 h-5"></i>
+                        </button>
+                    </div>
+
+                    {/* MAIN CONTENT */}
+                    <div className="p-4 pb-24">
                         
-                        {/* Header */}
-                        <div className="bg-emerald-600 p-4 flex justify-between items-center">
-                            <h1 className="font-bold text-white flex gap-2"><i data-lucide="zap"></i> Fast Sender</h1>
-                            <div className="text-xs bg-emerald-500 px-2 py-1 rounded text-emerald-100">Auto v6</div>
-                        </div>
-
-                        {/* Main Stage */}
-                        <div className="p-4">
-                            
-                            {/* Input Zone */}
-                            {(status === 'IDLE') && (
-                                <label className="block w-full h-40 border-2 border-dashed border-slate-600 rounded-xl bg-slate-700/50 hover:bg-slate-700 hover:border-emerald-400 transition cursor-pointer flex flex-col items-center justify-center text-slate-400">
-                                    <i data-lucide="upload-cloud" className="w-10 h-10 mb-2"></i>
-                                    <span className="text-sm font-semibold text-white">Upload Foto</span>
-                                    <span className="text-xs mt-1">Sistem otomatis kirim WA</span>
-                                    <input type="file" className="hidden" onChange={handleFile} accept="image/*"/>
-                                </label>
-                            )}
-
-                            {/* Visualization Zone (Apa yang dilihat AI) */}
-                            {status === 'OCR' && (
-                                <div className="space-y-2">
-                                    <p className="text-xs text-blue-300 text-center animate-pulse">Sedang memproses gambar...</p>
-                                    <div className="flex gap-2 h-32">
-                                        <div className="flex-1 relative rounded overflow-hidden border border-slate-600">
-                                            <img src={previewUrl} className="w-full h-full object-cover opacity-50"/>
-                                        </div>
-                                        <div className="flex-1 relative rounded overflow-hidden border border-blue-500">
-                                            {processedPreview ? <img src={processedPreview} className="w-full h-full object-cover"/> : <div className="w-full h-full bg-slate-900"/>}
-                                            <div className="scan-line"></div>
+                        {view === 'HISTORY' ? (
+                            <div className="space-y-3 animate-slide-up">
+                                <h2 className="text-slate-400 text-sm font-semibold mb-2">Riwayat Pengiriman</h2>
+                                {history.length === 0 && <p className="text-center text-slate-600 py-10">Belum ada riwayat.</p>}
+                                {history.map((h, i) => (
+                                    <div key={i} className="glass-panel p-3 rounded-xl border-l-4 border-l-primary">
+                                        <div className="flex justify-between items-start">
+                                            <div>
+                                                <div className="text-xs text-slate-400">{h.timestamp}</div>
+                                                <div className="font-mono text-sm font-bold text-white">{h.lat}, {h.long}</div>
+                                                <div className="text-xs text-slate-300 mt-1 line-clamp-1">{h.address}</div>
+                                            </div>
+                                            <a href={h.mapsLink} target="_blank" className="p-2 bg-slate-700 rounded-lg text-primary hover:bg-slate-600">
+                                                <i data-lucide="map" className="w-4 h-4"></i>
+                                            </a>
                                         </div>
                                     </div>
-                                </div>
-                            )}
-
-                            {/* Manual Fallback Zone */}
-                            {status === 'MANUAL' && (
-                                <div className="bg-slate-700/50 p-4 rounded-xl border border-orange-500/30 animate-fade-in">
-                                    <div className="flex items-center gap-2 mb-2 text-orange-400 font-bold text-sm">
-                                        <i data-lucide="alert-triangle" className="w-4 h-4"></i> Input Manual
+                                ))}
+                                <button onClick={() => {setHistory([]); localStorage.removeItem('geo_history')}} className="w-full py-3 text-xs text-red-400 hover:text-red-300 mt-4">Hapus Riwayat</button>
+                            </div>
+                        ) : (
+                            <div className="space-y-6">
+                                
+                                {/* 1. UPLOAD SECTION */}
+                                {status === 'IDLE' && (
+                                    <div className="animate-slide-up">
+                                        <label className="relative block group cursor-pointer">
+                                            <div className="absolute -inset-0.5 bg-gradient-to-r from-primary to-secondary rounded-2xl blur opacity-30 group-hover:opacity-60 transition duration-500"></div>
+                                            <div className="relative h-64 bg-slate-800 rounded-2xl border-2 border-dashed border-slate-600 flex flex-col items-center justify-center hover:border-slate-400 transition">
+                                                <div className="p-4 bg-slate-700 rounded-full mb-4 shadow-lg group-hover:scale-110 transition duration-300">
+                                                    <i data-lucide="scan-line" className="w-8 h-8 text-primary"></i>
+                                                </div>
+                                                <h3 className="font-bold text-lg text-white">Upload Bukti Foto</h3>
+                                                <p className="text-slate-400 text-xs mt-2 text-center max-w-[200px]">Mendukung EXIF GPS & Scan OCR Watermark</p>
+                                            </div>
+                                            <input type="file" ref={fileInputRef} onChange={handleFile} accept="image/*" className="hidden" />
+                                        </label>
                                     </div>
-                                    <img src={processedPreview || previewUrl} className="w-full h-24 object-cover rounded mb-3 border border-slate-600 opacity-80"/>
-                                    <div className="grid grid-cols-2 gap-3 mb-3">
-                                        <input type="text" placeholder="Lat (-7.xxxxx)" className="bg-slate-900 border border-slate-600 rounded p-2 text-sm text-white" value={gpsData.lat} onChange={e => setGpsData({...gpsData, lat: e.target.value})} />
-                                        <input type="text" placeholder="Long (110.xxxxx)" className="bg-slate-900 border border-slate-600 rounded p-2 text-sm text-white" value={gpsData.long} onChange={e => setGpsData({...gpsData, long: e.target.value})} />
+                                )}
+
+                                {/* 2. PREVIEW & MAPS (SUCCESS STATE) */}
+                                {(status === 'SUCCESS' || status === 'MANUAL_INPUT') && (
+                                    <div className="animate-slide-up space-y-4">
+                                        
+                                        {/* Result Card */}
+                                        <div className="glass-panel rounded-2xl p-1 overflow-hidden">
+                                            {/* Photo Preview */}
+                                            <div className="relative h-48 bg-black/50 rounded-t-xl overflow-hidden group">
+                                                <img src={preview} className="w-full h-full object-cover" />
+                                                <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent p-3 pt-10">
+                                                    <p className="text-xs text-primary font-bold flex items-center gap-1">
+                                                        <i data-lucide="check-circle" className="w-3 h-3"></i> TERVERIFIKASI
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            
+                                            {/* Data Details */}
+                                            <div className="p-4 space-y-3">
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div className="bg-slate-800 p-2 rounded-lg">
+                                                        <label className="text-[10px] text-slate-400 uppercase">Latitude</label>
+                                                        {status === 'MANUAL_INPUT' ? 
+                                                            <input type="number" className="bg-transparent w-full text-sm font-bold outline-none border-b border-slate-600 focus:border-primary" value={data.lat} onChange={e=>setData({...data, lat:e.target.value})} placeholder="-7.xxx" /> :
+                                                            <div className="font-mono font-bold text-sm">{data.lat}</div>
+                                                        }
+                                                    </div>
+                                                    <div className="bg-slate-800 p-2 rounded-lg">
+                                                        <label className="text-[10px] text-slate-400 uppercase">Longitude</label>
+                                                        {status === 'MANUAL_INPUT' ? 
+                                                            <input type="number" className="bg-transparent w-full text-sm font-bold outline-none border-b border-slate-600 focus:border-primary" value={data.long} onChange={e=>setData({...data, long:e.target.value})} placeholder="110.xxx" /> :
+                                                            <div className="font-mono font-bold text-sm">{data.long}</div>
+                                                        }
+                                                    </div>
+                                                </div>
+
+                                                <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700">
+                                                    <div className="flex items-start gap-2">
+                                                        <i data-lucide="map-pin" className="w-4 h-4 text-secondary mt-0.5 shrink-0"></i>
+                                                        <p className="text-xs text-slate-300 leading-relaxed">{status === 'MANUAL_INPUT' ? 'Lokasi manual (isi koordinat di atas)' : data.address}</p>
+                                                    </div>
+                                                </div>
+
+                                                {/* Mini Map (Iframe) */}
+                                                {(data.lat && data.long) && (
+                                                    <div className="h-32 w-full rounded-lg overflow-hidden border border-slate-700 relative">
+                                                        <iframe 
+                                                            width="100%" 
+                                                            height="100%" 
+                                                            frameBorder="0" 
+                                                            scrolling="no" 
+                                                            marginHeight="0" 
+                                                            marginWidth="0" 
+                                                            className="map-frame"
+                                                            src={`https://www.openstreetmap.org/export/embed.html?bbox=${parseFloat(data.long)-0.002},${parseFloat(data.lat)-0.002},${parseFloat(data.long)+0.002},${parseFloat(data.lat)+0.002}&layer=mapnik&marker=${data.lat},${data.long}`}
+                                                        ></iframe>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* Action Buttons */}
+                                        <div className="grid grid-cols-1 gap-3">
+                                            <button 
+                                                onClick={shareViaNative}
+                                                className="relative group w-full py-4 bg-primary text-slate-900 rounded-xl font-bold text-sm shadow-lg shadow-primary/20 hover:shadow-primary/40 transition-all active:scale-[0.98] overflow-hidden"
+                                            >
+                                                <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
+                                                <span className="relative flex items-center justify-center gap-2">
+                                                    <i data-lucide="send" className="w-5 h-5"></i>
+                                                    KIRIM FOTO & LOKASI KE WA
+                                                </span>
+                                            </button>
+                                            
+                                            <button 
+                                                onClick={() => { setStatus('IDLE'); setFile(null); setPreview(null); }}
+                                                className="w-full py-3 bg-slate-800 text-slate-400 rounded-xl font-medium text-xs hover:bg-slate-700 border border-slate-700 transition"
+                                            >
+                                                Scan Foto Lain
+                                            </button>
+                                        </div>
                                     </div>
-                                    {/* Tombol ini juga memanggil finish() yang mentrigger auto-send */}
-                                    <button onClick={() => finish(gpsData.lat, gpsData.long, "MANUAL")} className="w-full bg-orange-600 hover:bg-orange-700 text-white py-2 rounded text-sm font-bold">Kirim Auto</button>
-                                </div>
-                            )}
+                                )}
 
-                            {/* Success Zone */}
-                            {status === 'SUCCESS' && (
-                                <div className="text-center py-8">
-                                    <div className="w-20 h-20 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center mx-auto mb-4 border-2 border-emerald-500 animate-pulse">
-                                        <i data-lucide="send" className="w-10 h-10 ml-1"></i>
+                                {/* 3. LOADING STATE */}
+                                {(status === 'PROCESSING' || status === 'OCR_SCANNING') && (
+                                    <div className="text-center py-20 space-y-6">
+                                        <div className="relative w-24 h-24 mx-auto">
+                                            <div className="absolute inset-0 border-4 border-slate-700 rounded-full"></div>
+                                            <div className="absolute inset-0 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
+                                            <i data-lucide="aperture" className="absolute inset-0 m-auto text-primary w-8 h-8 animate-pulse"></i>
+                                        </div>
+                                        <div>
+                                            <h3 className="text-white font-bold text-lg animate-pulse">
+                                                {status === 'PROCESSING' ? 'Menganalisis Metadata...' : 'AI Vision Scanning...'}
+                                            </h3>
+                                            <p className="text-slate-400 text-xs mt-2">Sedang mengekstrak data dari foto</p>
+                                        </div>
+                                        
+                                        {/* Live Logs */}
+                                        <div className="max-w-[280px] mx-auto bg-black/40 rounded-lg p-3 text-[10px] font-mono text-left h-24 overflow-hidden relative">
+                                            <div className="absolute bottom-0 left-0 w-full h-8 bg-gradient-to-t from-black/40 to-transparent pointer-events-none"></div>
+                                            {logs.map((l, i) => <div key={i} className="text-slate-400 mb-1 truncate">{l}</div>)}
+                                        </div>
                                     </div>
-                                    <h2 className="text-xl font-bold text-white">Membuka WhatsApp...</h2>
-                                    <p className="text-slate-400 text-xs mt-2">Mohon tunggu sebentar</p>
-                                </div>
-                            )}
+                                )}
 
-                        </div>
-
-                        {/* Logs Console */}
-                        <div className="bg-black/50 p-3 h-20 overflow-y-auto font-mono text-[10px] text-slate-500 border-t border-slate-700">
-                            {logs.map((l, i) => <div key={i}>{l}</div>)}
-                        </div>
+                            </div>
+                        )}
                     </div>
                 </div>
             );
@@ -258,7 +407,9 @@
 
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
-        lucide.createIcons();
+        
+        // Init Icons
+        setTimeout(() => lucide.createIcons(), 100);
     </script>
 </body>
 </html>
